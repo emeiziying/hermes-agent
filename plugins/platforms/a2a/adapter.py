@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from gateway.config import Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
 from . import protocol, security
+from .approvals import TaskApprovals
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,8 @@ _METHOD_TABLE = (
     ("_rpc_message_send", "SendMessage", "message/send"),
     ("_rpc_message_stream", "SendStreamingMessage", "message/stream"),
     ("_rpc_tasks_get", "GetTask", "tasks/get"),
+    ("_rpc_approvals_list", "ListTaskApprovals"),
+    ("_rpc_approval_respond", "RespondTaskApproval"),
     ("_rpc_tasks_list", "ListTasks", "tasks/list"),
     ("_rpc_tasks_cancel", "CancelTask", "tasks/cancel"),
     ("_rpc_tasks_subscribe", "SubscribeToTask", "tasks/subscribe"),
@@ -254,7 +258,10 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         elif handler_name == "_rpc_tasks_subscribe":
             adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent)
         else:  # plain JSON task / push-config queries
-            self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
+            kwargs = {"agent": agent}
+            if handler_name in {"_rpc_approvals_list", "_rpc_approval_respond", "_rpc_tasks_get"}:
+                kwargs["peer"] = identity
+            self._json(200, getattr(adapter, handler_name)(req_id, params, **kwargs))
 
 
 class A2AAdapter(BasePlatformAdapter):
@@ -298,6 +305,10 @@ class A2AAdapter(BasePlatformAdapter):
         # Request ownership outlives reply Futures and also covers synchronous profile forwards.
         self._active_tasks: set[str] = set()
         self._pending_lock = threading.Lock()
+        self._task_approvals = TaskApprovals(self)
+        self._background_context = contextvars.copy_context()
+        self._context_owners: dict[str, tuple] = {}
+        self._context_active: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -492,8 +503,11 @@ class A2AAdapter(BasePlatformAdapter):
             self._active_tasks.add(task_id)
 
     def _pop_pending(self, task_id: str) -> None:
+        rec = self.tasks.get(task_id)
         with self._pending_lock:
             self._active_tasks.discard(task_id)
+            if rec:
+                self._context_active.discard(rec["context_id"])
             entry = self._pending.pop(task_id, None)
             order = self._pending_order.get(entry[0]) if entry else None
             if order and task_id in order:
@@ -526,6 +540,8 @@ class A2AAdapter(BasePlatformAdapter):
     def _end_task(self, rec: dict, state: str, text: str, stored_reply: str = "") -> tuple[dict, None]:
         """Complete a task immediately (rejected / not ready) and build its terminal Task."""
         self.tasks.complete(rec["task_id"], state, stored_reply)
+        with self._pending_lock:
+            self._context_active.discard(rec["context_id"])
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
@@ -536,6 +552,15 @@ class A2AAdapter(BasePlatformAdapter):
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
+        owner = (peer, *self._scope_for_agent(agent))
+        with self._pending_lock:
+            previous = self._context_owners.setdefault(context_id, owner)
+            busy = context_id in self._context_active
+            if previous == owner and not busy:
+                self._context_active.add(context_id)
+        if previous != owner or busy:
+            return protocol.build_task(task_id, context_id, protocol.STATE_REJECTED,
+                                       "Context belongs to another caller or already has an active task."), None
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
@@ -641,6 +666,7 @@ class A2AAdapter(BasePlatformAdapter):
             return state, reply
         finally:
             self._pop_pending(task_id)
+            self._task_approvals.discard(task_id)
 
     @staticmethod
     def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str]:
@@ -666,6 +692,13 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         task, pending = self._prepare_task(params, peer, agent=agent)
+        if task is None and (params.get("configuration") or {}).get("blocking") is False:
+            from agent.memory_provider import spawn_context_thread
+            worker = self._background_context.copy().run(
+                spawn_context_thread, lambda: self._finalize_task(pending, *self._await_reply(pending)),
+                name=f"a2a-task-{pending['task_id']}")
+            worker.start()
+            task = protocol.TaskStore.to_task(self.tasks.get(pending["task_id"]))
         if task is None:
             state, reply = self._finalize_task(pending, *self._await_reply(pending))
             task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
@@ -741,9 +774,39 @@ class A2AAdapter(BasePlatformAdapter):
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
         return task_id, rec, None if rec else _err(req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
 
-    def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
-        _task_id, rec, error = self._find_task(req_id, params, agent)
-        return error or _ok(req_id, protocol.TaskStore.to_task(rec))
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        return self._task_approvals.bind(prompt)
+
+    def _rpc_approvals_list(self, req_id, params, peer, agent=None):
+        task_id, context_id = str(params.get("taskId") or ""), str(params.get("contextId") or "")
+        try:
+            approvals = self._task_approvals.list(task_id, context_id, peer, agent)
+            return _ok(req_id, {"taskId": task_id, "contextId": context_id, "approvals": approvals})
+        except ValueError as exc:
+            return _err(req_id, protocol.ERR_INVALID_PARAMS, str(exc))
+
+    def _rpc_approval_respond(self, req_id, params, peer, agent=None):
+        try:
+            result = self._task_approvals.respond(
+                str(params.get("taskId") or ""), str(params.get("contextId") or ""), peer, agent,
+                str(params.get("requestId") or ""), params.get("choice"))
+            return _ok(req_id, result)
+        except ValueError as exc:
+            return _err(req_id, protocol.ERR_INVALID_PARAMS, str(exc))
+
+    def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None, peer=None) -> dict:
+        task_id, rec, error = self._find_task(req_id, params, agent)
+        if error:
+            return error
+        if peer is not None and (rec["peer"] != peer or
+                (rec.get("agent_slug", ""), rec.get("tenant", "")) != self._scope_for_agent(agent)):
+            return _err(req_id, protocol.ERR_TASK_NOT_FOUND, "task not found")
+        task = protocol.TaskStore.to_task(rec)
+        if peer is not None:
+            approvals = self._task_approvals.list(task_id, rec["context_id"], peer, agent)
+            if approvals:
+                task["metadata"] = {"approvals": approvals}
+        return _ok(req_id, task)
 
     def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
         offset = _to_int(params.get("pageToken") or 0, 0)

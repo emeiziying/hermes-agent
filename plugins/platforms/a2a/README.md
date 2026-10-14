@@ -88,3 +88,29 @@ via `tasks/get`.
 | `A2A_ADVERTISED_TOOLSETS` | all registered | Restrict skills on the Agent Card. |
 
 See `DESIGN.md` for architecture and the requirement-tracing table.
+
+
+## Local single-use approval extension
+
+This local patch adds `ListTaskApprovals` and `RespondTaskApproval` JSON-RPC methods.
+These methods are custom extensions, not standard A2A methods.
+
+Send `configuration.blocking=false` with `SendMessage` to receive a task before execution finishes.
+Poll `GetTask` for `metadata.approvals`, or call `ListTaskApprovals` with `taskId` and `contextId`.
+Each approval contains `requestId`, `command`, `description`, `choices`, and an ISO `expiresAt` timestamp.
+
+Call `RespondTaskApproval` with `taskId`, `contextId`, `requestId`, and `choice` (`once` or `deny`).
+The response contains `taskId`, `requestId`, and `resolved: true`.
+Approval replies must use the same authenticated peer and agent scope as the task.
+The bridge must authenticate the human responder and display the exact requested command.
+
+The native approval queue remains authoritative. The patch does not disable manual approval or grant session-wide permission.
+Expired, consumed, mismatched, and broader grants are rejected. Approval resumes the existing remote task.
+A context accepts one active task and remains bound to its originating peer and agent scope.
+Pending bindings reside in memory; this patch does not restore executing tasks after a gateway restart.
+Forwarded CLI profiles do not expose native approval through this bridge.
+This patch does not claim complete ownership enforcement for other existing task RPC methods.
+
+An isolated live validation used a real gateway and one approved read-only computation.
+The computation ran once and returned 60; replay and broader grants were rejected.
+The permanent gateway was not upgraded. Keep this patch separate until deployment is explicitly scheduled.
